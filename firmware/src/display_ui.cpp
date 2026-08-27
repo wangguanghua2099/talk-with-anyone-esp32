@@ -8,7 +8,10 @@
 //     属低频事件，不会形成频闪。
 // 布局：顶栏 0~21px（状态+音量），字幕区 24~239px（约 12 行）
 #include <Arduino.h>
+#include <WiFi.h>
 #include <LovyanGFX.hpp>
+#include <driver/adc.h>
+#include <time.h>
 #include <vector>
 #include "display_ui.h"
 #include "config.h"
@@ -62,6 +65,17 @@ static int s_vol = 80;
 static uint32_t s_lastDraw = 0;
 static bool s_dirtySub = true;      // 字幕区待刷新（差异路径内部再判每行是否真变了）
 static bool s_dirtyBar = true;      // 顶栏待刷新
+
+// ---- 顶栏附加显示（时间/WiFi/电量；音量仅调节时临时显示） ----
+static uint32_t s_volShowUntil = 0; // 音量临时显示截止时刻（0=不显示）
+static int s_lastHour = -1, s_lastMin = -1;
+static bool s_timeValid = false;
+static bool s_wifiConn = false;
+static int s_battLevel = -1;        // 0~100，-1=未知
+static bool s_battCharging = false;
+static uint32_t s_lastBattMs = 0;
+static uint32_t s_last1sMs = 0;
+static bool s_adcInit = false;
 
 // ---------- 字幕数据 ----------
 static std::vector<String> s_lines;      // 已完成行
@@ -162,6 +176,10 @@ bool begin() {
     ledcAttachPin(DISPLAY_BACKLIGHT_PIN, 7);
     ledcWrite(7, 220);
 
+    // 电池电压 ADC（ADC2_CH6=S3 GPIO17，卖家源码确认）+ 充电检测引脚
+    pinMode(PIN_BAT_CHG, INPUT);
+    s_adcInit = (adc2_config_channel_atten(ADC2_CHANNEL_6, ADC_ATTEN_DB_11) == ESP_OK);
+
     prepFont(s_lcd);
     Serial.println("[UI] 屏幕就绪 ST7789 240x240 (efont 中文 · 局部重绘防闪烁)");
     return true;
@@ -181,6 +199,77 @@ void setVolume(int v) {
     if (s_vol == v) return;
     s_vol = v;
     s_dirtyBar = true;
+    s_volShowUntil = millis() + 1500;   // 仅调节后 1.5s 内显示音量
+}
+
+// ---------- 顶栏后台信息（1s 周期） ----------
+
+// 卖家源码标定的 ADC→电量映射（12bit 原始值）
+static void pollBattery() {
+    if (!s_adcInit) return;
+    int v1 = 0, v2 = 0;
+    esp_err_t e1 = adc2_get_raw(ADC2_CHANNEL_6, ADC_WIDTH_BIT_12, &v1);
+    delay(5);
+    esp_err_t e2 = adc2_get_raw(ADC2_CHANNEL_6, ADC_WIDTH_BIT_12, &v2);
+    if (e1 != ESP_OK || e2 != ESP_OK) {
+        static bool reported = false;          // 只报一次，避免刷屏
+        if (!reported) {
+            reported = true;
+            Serial.printf("[电量] ADC读取失败 err=%d/%d（WiFi占用ADC2则电量不可用）\n",
+                          e1, e2);
+        }
+        return;
+    }
+    int adc = (v1 + v2) / 2;
+
+    static const struct { uint16_t adc; uint8_t lvl; } L[] = {
+        {1970, 0}, {2062, 20}, {2154, 40}, {2246, 60}, {2338, 80}, {2430, 100}
+    };
+    int lvl;
+    if (adc <= L[0].adc) lvl = 0;
+    else if (adc >= L[5].adc) lvl = 100;
+    else {
+        lvl = 0;
+        for (int i = 0; i < 5; i++) {
+            if (adc >= L[i].adc && adc < L[i + 1].adc) {
+                float r = (float)(adc - L[i].adc) / (L[i + 1].adc - L[i].adc);
+                lvl = L[i].lvl + (int)(r * (L[i + 1].lvl - L[i].lvl));
+                break;
+            }
+        }
+    }
+    bool chg = digitalRead(PIN_BAT_CHG) == HIGH && lvl < 100;
+    if (lvl != s_battLevel || chg != s_battCharging) s_dirtyBar = true;
+    s_battLevel = lvl;
+    s_battCharging = chg;
+    Serial.printf("[电量] adc=%d level=%d%% charging=%d\n", adc, lvl, chg);
+}
+
+static void topBarHousekeeping() {
+    uint32_t now = millis();
+    if (s_volShowUntil && now > s_volShowUntil) {   // 音量临时条到期
+        s_volShowUntil = 0;
+        s_dirtyBar = true;
+    }
+    if (now - s_last1sMs < 1000) return;
+    s_last1sMs = now;
+
+    struct tm tmnow;
+    bool tv = getLocalTime(&tmnow, 0);
+    if (tv != s_timeValid ||
+        (tv && (tmnow.tm_hour != s_lastHour || tmnow.tm_min != s_lastMin))) {
+        s_timeValid = tv;
+        if (tv) { s_lastHour = tmnow.tm_hour; s_lastMin = tmnow.tm_min; }
+        s_dirtyBar = true;                          // 分钟变化才重绘
+    }
+
+    bool conn = (WiFi.status() == WL_CONNECTED);
+    if (conn != s_wifiConn) { s_wifiConn = conn; s_dirtyBar = true; }
+
+    if (s_lastBattMs == 0 || now - s_lastBattMs >= 30000) {
+        s_lastBattMs = now;
+        pollBattery();                              // 30s 一测，电量变化才重绘
+    }
 }
 
 // ---------- 字幕 API ----------
@@ -306,7 +395,6 @@ static void drawSubtitles() {
 static void drawTopBar() {
     const uint16_t bg = 0x1202;   // 深绿黑（#104010 的合法 RGB565 换算）
     s_lcd.fillRect(0, 0, 240, 22, bg);
-    s_lcd.setTextFont(1);
     s_lcd.setFont(&fonts::efontCN_12);
     // 合法 RGB565 值：原 0x40FFA0 等常量超出 16 位被截断成错误颜色
     uint16_t c = TFT_WHITE;
@@ -316,11 +404,42 @@ static void drawTopBar() {
     s_lcd.setTextColor(c, bg);
     s_lcd.setCursor(6, 5);
     s_lcd.print(s_state);
-    s_lcd.setTextColor(TFT_CYAN, bg);
-    char buf[12];
-    snprintf(buf, sizeof(buf), "VOL %d%%", s_vol);
-    s_lcd.setCursor(176, 5);
-    s_lcd.print(buf);
+
+    if (s_volShowUntil) {
+        // 音量调节临时条（1.5s）
+        s_lcd.setTextColor(TFT_CYAN, bg);
+        char buf[12];
+        snprintf(buf, sizeof(buf), "VOL %d%%", s_vol);
+        s_lcd.setCursor(176, 5);
+        s_lcd.print(buf);
+    } else {
+        // 时间（NTP 对时后显示，未同步显示 --:--）
+        char tbuf[8];
+        if (s_timeValid) snprintf(tbuf, sizeof(tbuf), "%02d:%02d", s_lastHour, s_lastMin);
+        else snprintf(tbuf, sizeof(tbuf), "--:--");
+        s_lcd.setTextColor(TFT_WHITE, bg);
+        s_lcd.setCursor(150, 5);
+        s_lcd.print(tbuf);
+        // WiFi 信号柱（三格）
+        uint16_t wc = s_wifiConn ? TFT_CYAN : 0x630C;
+        s_lcd.fillRect(190, 10, 3, 5, wc);
+        s_lcd.fillRect(195, 7, 3, 8, wc);
+        s_lcd.fillRect(200, 4, 3, 11, wc);
+        // 电量百分比（右对齐），充电中且未满时左侧画小闪电
+        char bbuf[6];
+        if (s_battLevel < 0) snprintf(bbuf, sizeof(bbuf), "--%%");
+        else snprintf(bbuf, sizeof(bbuf), "%d%%", s_battLevel);
+        int bw = s_lcd.textWidth(bbuf);
+        s_lcd.setTextColor(TFT_WHITE, bg);
+        s_lcd.setCursor(237 - bw, 5);
+        s_lcd.print(bbuf);
+        if (s_battCharging) {
+            int bx = 237 - bw - 8;
+            s_lcd.drawLine(bx + 2, 3, bx, 8, 0xFFE0);
+            s_lcd.drawLine(bx, 8, bx + 3, 8, 0xFFE0);
+            s_lcd.drawLine(bx + 3, 8, bx + 1, 13, 0xFFE0);
+        }
+    }
     s_lcd.setFont(&fonts::efontCN_14);
 }
 
@@ -352,8 +471,11 @@ static void tickTypewriter() {
 }
 
 void tick() {
-    tickTypewriter();
     if (!s_ok) return;
+
+    tickTypewriter();
+    topBarHousekeeping();               // 时间/WiFi/电量/音量条到期（内部标脏）
+
     if (!s_dirtySub && !s_dirtyBar) return;
 
     uint32_t ivl = typingActive() ? TYPE_DRAW_MS : IDLE_DRAW_MS;

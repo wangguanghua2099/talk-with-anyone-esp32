@@ -96,8 +96,16 @@ void setVolume(int v) {
 int getVolume() { return s_volume; }
 
 inline int32_t applyVolume(int16_t v) {
-    float factor = (s_volume / 100.0f) * (s_volume / 100.0f);   // 平方曲线
-    return (int32_t)((float)v * factor * 65536.0f);
+    // 音量平方曲线 + 输入预增益 + 软限幅：
+    // SPK_INPUT_GAIN 使 50% 音量达到原先 100% 的响度；大信号经软限幅压缩，
+    // 避免直接放大导致的数字削波破音（增益后峰值渐近 2*SPK_SOFTCLIP_K）
+    float factor = (s_volume / 100.0f) * (s_volume / 100.0f);
+    float x = (float)v * SPK_INPUT_GAIN * factor;
+    float a = x < 0 ? -x : x;
+    if (a > SPK_SOFTCLIP_K)
+        a = SPK_SOFTCLIP_K + (a - SPK_SOFTCLIP_K) * SPK_SOFTCLIP_K / a;
+    int32_t y = (int32_t)(x < 0 ? -a : a);
+    return y << 16;
 }
 
 // 追加服务端 mono16 数据；采样率与输出一致时直通，否则线性插值重采样
@@ -224,7 +232,7 @@ void playTone(uint32_t freqHz, uint32_t durationMs) {
             size_t idx = i + j;
             if (idx < 160) env = idx / 160.0f;
             if (idx > n - 160) env = (n - idx) / 160.0f;
-            float smp = sinf(2 * 3.14159265f * freqHz * t) * 9000 * env;
+            float smp = sinf(2 * 3.14159265f * freqHz * t) * 2600 * env;
             out[j] = applyVolume((int16_t)smp);
         }
         size_t written = 0;

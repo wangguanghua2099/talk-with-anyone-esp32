@@ -25,7 +25,9 @@ static uint32_t s_bargeWinMs = 0;       // 当前统计窗起点
 static uint64_t s_bargeMicAbs = 0;      // 窗内麦克风|样本|累计
 static uint32_t s_bargeMicN = 0;        // 窗内麦克风样本数
 static uint64_t s_bargeOutPrev = 0;     // 上窗末的输出能量计数
-static float s_bargeK = 0.6f;           // 回声通路增益估计（自适应，跨会话保留）
+static float s_bargePeak = 0.0f;        // 输出包络峰保持（衰减式，覆盖词间隙/混响尾）
+static float s_bargeK = 0.6f;           // 回声通路增益估计（起播标定+自适应）
+static int s_bargeCalibN = 0;           // 本次起播标定已完成的窗口数
 static uint32_t s_bargeHitMs = 0;       // 连续命中时长
 
 static bool btnPressed(int pin) { return digitalRead(pin) == LOW; }
@@ -52,9 +54,9 @@ static void syncUi() {
     DisplayUI::setVolume(AudioOut::getVolume());
 }
 
-static void enterListening(bool withBeep = true) {
+static void enterListening(bool withBeep = false) {
     if (!VoiceClient::isUp()) return;
-    if (withBeep) AudioOut::playTone(1320, 120);
+    // 重进聆听不再提示音（原 1320Hz 短音在超时重听/重连重听时会不定期出现）
     if (!VoiceClient::startRecording()) return;
     s_state = ST_LISTENING;
     s_pressStart = millis();
@@ -92,6 +94,7 @@ void setup() {
     }
     Serial.printf("\n[WiFi] 已连接, IP: %s\n", WiFi.localIP().toString().c_str());
     DisplayUI::setInfo(WiFi.localIP().toString());
+    configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org");   // 顶栏时钟（UTC+8）
 
     Serial.printf("[MEM] 建连前 heap=%u maxblk=%u psramFree=%u\n",
                   ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getFreePsram());
@@ -215,6 +218,8 @@ void loop() {
             s_bargeWinMs = millis();
             s_bargeMicAbs = 0; s_bargeMicN = 0;
             s_bargeOutPrev = AudioOut::absOutAccum();
+            s_bargePeak = 0;
+            s_bargeCalibN = 0;                   // 重新标定回声增益（音量可能已变）
             s_bargeHitMs = 0;
         }
         {
@@ -235,17 +240,33 @@ void loop() {
             float micAvg = s_bargeMicN ? (float)s_bargeMicAbs / s_bargeMicN : 0.0f;
             float outAvg = (float)outWin / (SPK_SAMPLE_RATE * 0.05f);  // v域每样本均值
 
+            // 输出包络峰保持：跨词间隙/句间停顿维持门限，防止门限塌陷误触发
+            s_bargePeak = outAvg > s_bargePeak ? outAvg : s_bargePeak * 0.75f;
+
             bool cond = false;
             if (micAvg > BARGE_IN_SPEECH_FLOOR) {
-                if (outAvg < BARGE_IN_OUT_FLOOR) {
-                    cond = true;                  // 播放间隙：麦克风有声即人声
+                if (s_bargePeak < BARGE_IN_OUT_FLOOR) {
+                    // 播放间隙（起播缓冲/句间停顿）：要求明显人声
+                    cond = micAvg > BARGE_IN_GATE_MIN;
                 } else {
-                    // 回声增益自适应：下降快、上升慢，用户说话不抬高门限
-                    float r = micAvg / outAvg;
-                    if (r < s_bargeK) s_bargeK = s_bargeK * 0.7f + r * 0.3f;
-                    else if (r < s_bargeK * 2.0f) s_bargeK = s_bargeK * 0.95f + r * 0.05f;
-                    if (micAvg > s_bargeK * outAvg * BARGE_IN_GATE_RATIO + BARGE_IN_SLACK)
-                        cond = true;
+                    // 起播标定期（前8个有声窗）：快速估计回声增益，此间不触发
+                    if (s_bargeCalibN < 8) {
+                        if (outAvg > 500) {
+                            float r = micAvg / outAvg;
+                            s_bargeK = 0.5f * s_bargeK + 0.5f * r;
+                            s_bargeCalibN++;
+                        }
+                    } else {
+                        // 常态：仅下行自适应（上行极慢），避免用户说话抬高门限
+                        float r = micAvg / s_bargePeak;
+                        if (r < s_bargeK) s_bargeK = s_bargeK * 0.9f + r * 0.1f;
+                        else if (r < s_bargeK * 1.3f) s_bargeK = s_bargeK * 0.98f + r * 0.02f;
+                        if (s_bargeK < 0.2f) s_bargeK = 0.2f;
+                        if (s_bargeK > 2.5f) s_bargeK = 2.5f;
+                        float gate = s_bargeK * s_bargePeak * BARGE_IN_GATE_RATIO + BARGE_IN_SLACK;
+                        if (gate < BARGE_IN_GATE_MIN) gate = BARGE_IN_GATE_MIN;
+                        cond = micAvg > gate;
+                    }
                 }
             }
             s_bargeHitMs = cond ? s_bargeHitMs + 50 : 0;
@@ -253,8 +274,9 @@ void loop() {
             static uint32_t s_lastDiag = 0;       // 每2s打印一次，便于调参
             if (millis() - s_lastDiag > 2000) {
                 s_lastDiag = millis();
-                Serial.printf("[打断监测] mic=%.0f out=%.0f k=%.2f hit=%lums\n",
-                              micAvg, outAvg, s_bargeK, (unsigned long)s_bargeHitMs);
+                Serial.printf("[打断监测] mic=%.0f out=%.0f pk=%.0f k=%.2f hit=%lums\n",
+                              micAvg, outAvg, s_bargePeak, s_bargeK,
+                              (unsigned long)s_bargeHitMs);
             }
 
             s_bargeMicAbs = 0; s_bargeMicN = 0;
@@ -262,8 +284,8 @@ void loop() {
 
             if (s_bargeHitMs >= BARGE_IN_SUSTAIN_MS &&
                 millis() - s_playStartMs > BARGE_IN_START_DELAY_MS) {
-                Serial.printf("[打断] 检测到用户说话，打断播放 (mic=%.0f out=%.0f k=%.2f)\n",
-                              micAvg, outAvg, s_bargeK);
+                Serial.printf("[打断] 检测到用户说话，打断播放 (mic=%.0f pk=%.0f k=%.2f)\n",
+                              micAvg, s_bargePeak, s_bargeK);
                 VoiceClient::sendInterrupt();
                 DisplayUI::flushTyping();
                 AudioOut::stopPlayback();

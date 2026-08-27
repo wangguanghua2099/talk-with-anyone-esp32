@@ -31,6 +31,12 @@
 #define SPK_SAMPLE_RATE      16000  // 下行（鹿小班同款 16k；服务端 audio.start 会覆盖）
 #define MIC_SHIFT            14     // INMP441 32bit→16bit 右移位数：14=约4倍增益，无声改16
 #define MIC_SLOT_LEFT        1      // 麦克风 L/R 接地=左声道；若录音全静音改成 0
+#define SPK_INPUT_GAIN       4.0f   // 输出预增益：音量50%≈原来100%的响度
+#define SPK_SOFTCLIP_K       16000  // 软限幅拐点（v域），峰值压缩防破音，上限32000
+
+// ===== 电源（鹿小班第三代 · 卖家源码 luxiaoban-xiaozhi-1.54tft-wifi 确认）=====
+#define PIN_BAT_CHG          38     // 充电检测：高电平=充电中
+// 电池电压走 ADC2_CHANNEL_6（S3 上即 GPIO17），映射表见 display_ui.cpp
 
 // ===== 板级引脚（鹿小班第三代 · 卖家源码 luxiaoban-xiaozhi-1.54tft-wifi 确认）=====
 // 麦克风：PDM 数字麦！GPIO2=CLK, GPIO3=DATA（不是 I2S 麦，勿改回 4/5/6）
@@ -63,11 +69,14 @@
 
 // ===== 语音打断（播放期间说话打断 AI 朗读）=====
 // 原理：播放中麦克风只测能量不发送（回声不会到服务端 VAD）；
-// 用输出能量做回声参考，麦克风能量持续显著高于"回声估计值"判定为用户说话。
+// 用输出能量做回声参考（kEcho 每次起播自动标定），麦克风能量显著高于
+// "回声估计值"且持续一段时间判定为用户说话。
+// 实测参考（鹿小班三代）：安静环境麦克风均值≈500~2000，用户说话≈10000+。
 #define BARGE_IN_ENABLE         1        // 1=启用语音打断；0=仅按键打断
-#define BARGE_IN_SPEECH_FLOOR   800      // 麦克风平均|样本|高于此值才算有声音（v域）
-#define BARGE_IN_OUT_FLOOR      1200     // 输出参考均值低于此值视为播放间隙，直接按人声判
-#define BARGE_IN_GATE_RATIO     3.0f     // 麦克风能量需超过 回声估计*该倍数+余量
-#define BARGE_IN_SLACK          300      // 门限绝对余量（v域），防小信号比值爆炸
+#define BARGE_IN_SPEECH_FLOOR   2000     // 麦克风均值下限（高于环境底，低于人声）
+#define BARGE_IN_OUT_FLOOR      1200     // 输出峰保持低于此值=播放间隙
+#define BARGE_IN_GATE_MIN       3500     // 触发门限下限（间隙模式/安静段兜底）
+#define BARGE_IN_GATE_RATIO     3.0f     // 门限 = kEcho*输出峰保持*该倍数+余量
+#define BARGE_IN_SLACK          300      // 门限绝对余量（v域）
 #define BARGE_IN_SUSTAIN_MS     250      // 条件需持续命中该时长才触发
-#define BARGE_IN_START_DELAY_MS 700      // 起播静默期，跳过起播瞬态
+#define BARGE_IN_START_DELAY_MS 700      // 起播静默期，跳过起播瞬态与缓冲填充
