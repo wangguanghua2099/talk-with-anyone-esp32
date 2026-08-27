@@ -60,3 +60,14 @@
 #define RELEASE_SILENCE_MS    700         // 松开后补发静音，让服务端 VAD 判定语句结束
 #define PLAY_WATERMARK_BYTES  (32 * 1024) // 缓冲到该水量才开始播放，降低卡顿
 #define LISTEN_TIMEOUT_MS     (3 * 60 * 1000UL)  // 聆听状态无人说话自动退出（3分钟）
+
+// ===== 语音打断（播放期间说话打断 AI 朗读）=====
+// 原理：播放中麦克风只测能量不发送（回声不会到服务端 VAD）；
+// 用输出能量做回声参考，麦克风能量持续显著高于"回声估计值"判定为用户说话。
+#define BARGE_IN_ENABLE         1        // 1=启用语音打断；0=仅按键打断
+#define BARGE_IN_SPEECH_FLOOR   800      // 麦克风平均|样本|高于此值才算有声音（v域）
+#define BARGE_IN_OUT_FLOOR      1200     // 输出参考均值低于此值视为播放间隙，直接按人声判
+#define BARGE_IN_GATE_RATIO     3.0f     // 麦克风能量需超过 回声估计*该倍数+余量
+#define BARGE_IN_SLACK          300      // 门限绝对余量（v域），防小信号比值爆炸
+#define BARGE_IN_SUSTAIN_MS     250      // 条件需持续命中该时长才触发
+#define BARGE_IN_START_DELAY_MS 700      // 起播静默期，跳过起播瞬态
