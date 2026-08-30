@@ -1,0 +1,18 @@
+# ===== 本地私密配置（WiFi 密码 / 局域网 IP / token）=====
+firmware/src/config_private.h
+
+# ===== 构建产物与 IDE 缓存 =====
+firmware/.pio/
+.vscode/
+*.code-workspace
+
+# ===== 第三方完整源码备份（官方固件 dump，仅本地留档）=====
+backup/
+
+# ===== 厂商硬件文档（版权归属待确认，暂不入库）=====
+docs/
+
+# ===== 系统/临时文件 =====
+Thumbs.db
+Desktop.ini
+.DS_Store
