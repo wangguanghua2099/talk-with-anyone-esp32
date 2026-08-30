@@ -15,7 +15,6 @@ static volatile bool s_doneFlag = false;
 
 static int s_volume = 80;                         // 软件音量 0~100
 static int s_inRate = 24000;                      // 本次流的服务端采样率
-static uint64_t s_absOutAccum = 0;                // 累计输出|样本|（音量后 v 域，回声参考）
 // 重采样状态（输入率→16k 线性插值）
 static float   s_rFrac = 0.0f;                    // 相位 [0,1)
 static int16_t s_rPrev = 0;                       // 上一个输入样本
@@ -69,8 +68,6 @@ inline int16_t rdSample(size_t pos) {
 }
 
 size_t buffered() { return (s_head - s_tail + RING_SIZE) % RING_SIZE; }
-
-uint64_t absOutAccum() { return s_absOutAccum; }
 
 bool active() { return s_streaming || buffered() > 0; }
 
@@ -203,8 +200,6 @@ void loop() {
         int16_t v = rdSample(s_tail);
         s_tail = (s_tail + 2) % RING_SIZE;
         out[i] = applyVolume(v);
-        int32_t a = out[i] >> 16;                 // 折回 v 域（含音量系数）
-        s_absOutAccum += (uint32_t)(a < 0 ? -a : a);
     }
     size_t written = 0;
     esp_err_t err = i2s_write(I2S_NUM_1, out, n * sizeof(int32_t),

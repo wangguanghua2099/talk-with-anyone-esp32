@@ -18,5 +18,4 @@ bool active();
 void setVolume(int v);                          // 0~100（软件音量，平方曲线）
 int  getVolume();
 void playTone(uint32_t freqHz, uint32_t durationMs);   // 状态提示音
-uint64_t absOutAccum();                         // 累计输出能量（v域|样本|和，语音打断的回声参考）
 }
