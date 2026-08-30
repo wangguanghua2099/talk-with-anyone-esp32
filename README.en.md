@@ -119,10 +119,7 @@ Speaker   ◀── WebSocket /ws/tts-stream ◀── PCM16 audio stream
 ## Known Limitations
 
 - Voice barge-in (interrupting by speaking) is not implemented on this
-  hardware; use the BOOT button instead. Low-cost boards like this one have no
-  hardware echo-reference channel between mic and amplifier, and software-only
-  echo cancellation cannot reliably separate echo from speech
-  (see the experiment history in the commit log).
+  hardware; use the BOOT button instead. 
 - The display driver is a generic ST7789 LovyanGFX panel config; other panels
   need their own setup.
 
