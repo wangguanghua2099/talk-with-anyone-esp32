@@ -122,6 +122,8 @@ Speaker   ◀── WebSocket /ws/tts-stream ◀── PCM16 audio stream
   hardware; use the BOOT button instead. 
 - The display driver is a generic ST7789 LovyanGFX panel config; other panels
   need their own setup.
+- Edge TTS is an on-cloud online speech synthesis system. It has not performed
+  streaming generation, the project is not adapted, and there is no audio playback.
 
 ## Acknowledgements
 
