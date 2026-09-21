@@ -12,6 +12,9 @@ void tick();                             // 主循环调用：打字机推进 + 
 // 字幕接口
 void addUserLine(const String &text);    // 用户说的话（绿色），立即整行显示
 void beginReplyTypewriter(const String &text); // AI 回复：逐字显示（与播放同步观感）
+void beginReplyStream();                 // AI 回复流式开始：等待 assistant.delta 追加
+void appendReplyDelta(const String &delta);    // 追加 LLM 文字增量（打字机引擎自动揭示）
+void setReplyFullText(const String &full);     // 回复完成：对账补齐剩余未显示的文字
 void flushTyping();                      // 立即显示剩余未打的字（打断时调用）
 void clearChat();                        // 清空字幕
 

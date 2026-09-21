@@ -82,8 +82,10 @@
 ```
 麦克风 PDM ──PCM16@16k──▶ WebSocket /ws/voice ──▶ 服务端 ASR ─▶ LLM
         （按键打断时发送 interrupt 控制帧）              │
-屏幕字幕   ◀── asr.result / assistant.completed 文本事件 ┘
-扬声器     ◀── WebSocket /ws/tts-stream ◀── PCM16 音频流
+屏幕字幕   ◀── asr.result / assistant.delta（流式打字）/       ┘
+               assistant.completed 文本事件
+扬声器     ◀── /ws/voice audio.chunk 边生成边推（主路径），
+               整轮无音频时回退 /ws/tts-stream 全文合成
                 （环形缓冲 + 线性插值重采样 → I2S 32bit 输出）
 ```
 

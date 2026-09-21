@@ -84,6 +84,8 @@ static String s_typingRest;              // 打字机剩余文本
 static String s_curLine;                 // 当前正在打的一行
 static uint16_t s_curColor = 0x07FF;
 static uint32_t s_lastTypeMs = 0;
+static bool s_streamMode = false;        // 流式回复进行中（assistant.delta 追加模式）
+static String s_streamQueued;            // 已进入打字缓冲的累计文本（与全文对账用）
 
 static constexpr int LINE_H = 18;        // efontCN_14 行高
 static constexpr int SUB_Y = 24;
@@ -285,10 +287,49 @@ void beginReplyTypewriter(const String &text) {
     s_typingRest = text;
     s_curLine = "";
     s_curColor = 0x07FF;
+    s_streamMode = false;
+    s_streamQueued = "";
     s_dirtySub = true;
 }
 
+// 流式字幕：LLM 增量追加进打字缓冲，由 tickTypewriter 按固定节奏揭示，
+// 字幕随 LLM 生成实时推进（LLM 快于揭示速度时缓冲排队，慢于时即时显示）
+void beginReplyStream() {
+    flushTyping();
+    s_typingRest = "";
+    s_curLine = "";
+    s_curColor = 0x07FF;
+    s_streamQueued = "";
+    s_streamMode = true;
+    s_dirtySub = true;
+}
+
+void appendReplyDelta(const String &delta) {
+    if (!delta.length()) return;
+    if (!s_streamMode) beginReplyStream();
+    s_typingRest += delta;
+    s_streamQueued += delta;
+    s_dirtySub = true;
+}
+
+// 回复完成：以后端全文为准。与已排队的增量做前缀对账，只补齐差额；
+// 没收到过增量（旧后端）或内容对不上时，整条按打字机重新显示
+void setReplyFullText(const String &full) {
+    if (s_streamMode && full.startsWith(s_streamQueued)) {
+        if (full.length() > s_streamQueued.length()) {
+            s_typingRest += full.substring(s_streamQueued.length());
+        }
+        s_streamMode = false;
+        s_streamQueued = "";
+        s_dirtySub = true;
+        return;
+    }
+    beginReplyTypewriter(full);
+}
+
 void flushTyping() {
+    s_streamMode = false;
+    s_streamQueued = "";
     if (s_typingRest.length() || s_curLine.length()) {
         String rest = s_curLine + s_typingRest;
         pushLines(rest, s_curColor);
@@ -301,6 +342,8 @@ void flushTyping() {
 void clearChat() {
     s_lines.clear(); s_colors.clear();
     s_typingRest = ""; s_curLine = "";
+    s_streamMode = false;
+    s_streamQueued = "";
     s_dirtySub = true;
 }
 
@@ -448,17 +491,34 @@ static void drawTopBar() {
 static void tickTypewriter() {
     if (!s_typingRest.length()) return;
     uint32_t now = millis();
-    if (now - s_lastTypeMs < 45) return;             // 45ms/字 ≈ 22字/秒
+    // 143ms/单位 ≈ 7 单位/秒，与 TTS 朗读速度大致同步（可读、不晃眼）：
+    // 中文按"字"、英文按"词"（单词+紧连标点+词后空格）各算一个揭示单位
+    if (now - s_lastTypeMs < 143) return;
     s_lastTypeMs = now;
 
-    // 每次取一个 UTF-8 字符
-    int len = 1;
-    uint8_t c = s_typingRest[0];
-    if (c >= 0xF0) len = 4;
-    else if (c >= 0xE0) len = 3;
-    else if (c >= 0xC0) len = 2;
-    String ch = s_typingRest.substring(0, len);
-    s_typingRest.remove(0, len);
+    // 计算本拍的揭示单位
+    const char *p = s_typingRest.c_str();
+    size_t n = s_typingRest.length();
+    size_t i = 0;
+    while (i < n && p[i] == ' ') i++;              // 前导空格并入本单位
+    if (i < n && (unsigned char)p[i] >= 0x21 && (unsigned char)p[i] <= 0x7E) {
+        // 英文：连续 ASCII 可见字符（单词/数字+紧连标点）整体一次揭示
+        while (i < n && (unsigned char)p[i] >= 0x21 && (unsigned char)p[i] <= 0x7E) i++;
+        while (i < n && p[i] == ' ') i++;          // 词后空格一并带出
+    } else {
+        // 中文等非 ASCII：按 1 个 UTF-8 字符揭示
+        uint8_t c = (unsigned char)p[i];
+        int len = 1;
+        if (c >= 0xF0) len = 4;
+        else if (c >= 0xE0) len = 3;
+        else if (c >= 0xC0) len = 2;
+        i += len;
+    }
+    if (i > n) i = n;
+    if (i == 0) i = 1;                             // 防御：保证每拍有推进
+
+    String ch = s_typingRest.substring(0, i);
+    s_typingRest.remove(0, i);
 
     String test = s_curLine + ch;
     if (textW(test) > SUB_W && s_curLine.length()) {

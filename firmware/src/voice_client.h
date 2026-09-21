@@ -1,4 +1,8 @@
 // voice_client.h —— /ws/voice 与 /ws/tts-stream 双 WebSocket 客户端
+//
+// /ws/voice 主通道（新协议，流式）：上行麦克风 PCM16，下行 assistant.delta
+// （字幕流式打字）+ audio.start/chunk/done（边生成边播）。
+// /ws/tts-stream 兜底通道：仅当整轮没收到过音频时，把全文送去合成（旧行为）。
 #pragma once
 #include <Arduino.h>
 #include <WebSocketsClient.h>

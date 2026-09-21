@@ -7,8 +7,12 @@
 
 namespace AudioOut {
 
-constexpr size_t RING_SIZE = 512 * 1024;          // 512KB PSRAM 环形缓冲（mono16）
+// 环形缓冲（mono16，PSRAM）。流式回复中服务端按"批"推送音频（一批约 48 字
+// ≈ 340KB@24k），而播放只消耗 32KB/s：512KB 小环在两批在途时就会溢出丢样，
+// 长文本后半段出现跳字卡顿/破音。8MB PSRAM 下优先 3MB（约 96 秒音频，
+// 可整段吸收 400+ 字回复），失败逐级回退。
 static uint8_t *s_ring = nullptr;
+static size_t s_ringSize = 0;
 static volatile size_t s_head = 0, s_tail = 0;
 static volatile bool s_streaming = false;
 static volatile bool s_doneFlag = false;
@@ -21,9 +25,18 @@ static int16_t s_rPrev = 0;                       // 上一个输入样本
 
 bool begin() {
     if (s_ring) return true;
-    s_ring = (uint8_t *)ps_malloc(RING_SIZE);
-    if (!s_ring) s_ring = (uint8_t *)malloc(RING_SIZE);
+    const size_t candidates[] = {3 * 1024 * 1024, 1536 * 1024, 512 * 1024};
+    for (size_t sz : candidates) {
+        s_ring = (uint8_t *)ps_malloc(sz);
+        if (!s_ring) s_ring = (uint8_t *)malloc(sz);
+        if (s_ring) {
+            s_ringSize = sz;
+            break;
+        }
+    }
     if (!s_ring) return false;
+    Serial.printf("[AudioOut] 环形缓冲 %uKB\n",
+                  (unsigned)(s_ringSize / 1024));
 
     i2s_config_t cfg = {};
     cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
@@ -63,11 +76,11 @@ void selfTest() {
 
 // 环形缓冲内按服务端字节序（小端 PCM16）读取一个样本
 inline int16_t rdSample(size_t pos) {
-    return (int16_t)((uint16_t)s_ring[pos % RING_SIZE] |
-                     ((uint16_t)s_ring[(pos + 1) % RING_SIZE] << 8));
+    return (int16_t)((uint16_t)s_ring[pos % s_ringSize] |
+                     ((uint16_t)s_ring[(pos + 1) % s_ringSize] << 8));
 }
 
-size_t buffered() { return (s_head - s_tail + RING_SIZE) % RING_SIZE; }
+size_t buffered() { return (s_head - s_tail + s_ringSize) % s_ringSize; }
 
 bool active() { return s_streaming || buffered() > 0; }
 
@@ -79,8 +92,8 @@ bool beginStream(uint32_t inputRate) {
     s_rPrev = 0;
     s_doneFlag = false;
     s_streaming = true;
-    Serial.printf("[AudioOut] 新音频流 输入%dHz→输出%dk\n",
-                  s_inRate, SPK_SAMPLE_RATE / 1000);
+    Serial.printf("[AudioOut][t=%lu] 新音频流 输入%dHz→输出%dk\n",
+                  (unsigned long)millis(), s_inRate, SPK_SAMPLE_RATE / 1000);
     return true;
 }
 
@@ -113,11 +126,11 @@ size_t feed(const uint8_t *mono16, size_t bytes) {
 
     // 直通：服务端已按设备输出率重采样
     if (s_inRate == SPK_SAMPLE_RATE) {
-        size_t space = (s_tail - s_head - 1 + RING_SIZE) % RING_SIZE;
+        size_t space = (s_tail - s_head - 1 + s_ringSize) % s_ringSize;
         size_t n = (bytes < space) ? bytes : space;
         for (size_t i = 0; i < n; i++) {
             s_ring[s_head] = mono16[i];
-            s_head = (s_head + 1) % RING_SIZE;
+            s_head = (s_head + 1) % s_ringSize;
         }
         return n;
     }
@@ -130,11 +143,11 @@ size_t feed(const uint8_t *mono16, size_t bytes) {
         bool full = false;
         while (t < 1.0f) {
             int32_t out = (int32_t)(s_rPrev + (int32_t)((s_cur - s_rPrev) * t));
-            size_t space = (s_tail - s_head - 1 + RING_SIZE) % RING_SIZE;
+            size_t space = (s_tail - s_head - 1 + s_ringSize) % s_ringSize;
             if (space < 2) { full = true; break; }
             s_ring[s_head] = (uint8_t)(out & 0xFF);
-            s_ring[(s_head + 1) % RING_SIZE] = (uint8_t)((out >> 8) & 0xFF);
-            s_head = (s_head + 2) % RING_SIZE;
+            s_ring[(s_head + 1) % s_ringSize] = (uint8_t)((out >> 8) & 0xFF);
+            s_head = (s_head + 2) % s_ringSize;
             t += ratio;
         }
         s_rFrac = (t >= 1.0f) ? (t - 1.0f) : t;
@@ -169,13 +182,13 @@ void loop() {
             size_t t = s_tail;
             for (int i = 0; i < 6; i++) {
                 probe[i] = rdSample(t);
-                t = (t + 2) % RING_SIZE;
+                t = (t + 2) % s_ringSize;
             }
             long sum = 0;
             size_t tt = s_tail;
             for (int i = 0; i < 256; i++) {
                 int16_t v = rdSample(tt);
-                tt = (tt + 2) % RING_SIZE;
+                tt = (tt + 2) % s_ringSize;
                 sum += v;
             }
             Serial.printf("[TTS][CHK-dev-ring] v=%d,%d,%d,%d sum256=%ld\n",
@@ -191,14 +204,15 @@ void loop() {
         if (s_doneFlag) {
             started = false;
             s_streaming = false;
-            Serial.println("[AudioOut] 播放完成");
+            Serial.printf("[AudioOut][t=%lu] 播放完成\n",
+                          (unsigned long)millis());
         }
         return;
     }
     size_t n = (availSamples < 128) ? availSamples : 128;
     for (size_t i = 0; i < n; i++) {
         int16_t v = rdSample(s_tail);
-        s_tail = (s_tail + 2) % RING_SIZE;
+        s_tail = (s_tail + 2) % s_ringSize;
         out[i] = applyVolume(v);
     }
     size_t written = 0;
